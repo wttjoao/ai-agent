@@ -1,59 +1,116 @@
-import ast
-from typing import Annotated, TypedDict
-
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage
+from typing import TypedDict, Optional
 from langchain_ollama import ChatOllama
+from langchain.messages import HumanMessage
+from langgraph.graph import StateGraph, END
+from langchain.tools import tool
+import requests
+import os
+import re
 
-from langgraph.graph import StateGraph, START
-from langgraph.graph.message import add_messages
-from langchain.agents import create_agent
+@tool("get_stock_price", description="Get the current stock price for a given ticker symbol.")
+def get_stock_price(ticker: str) -> str:
+    api_key = os.getenv("d50hmd9r01qsabpth2ggd50hmd9r01qsabpth2h0")
+    if not api_key:
+        return "ERROR: FINNHUB_API_KEY is missing"
 
-from langchain_core.messages import SystemMessage
+    url = "https://finnhub.io/api/v1/quote"
+    params = {"symbol": ticker, "token": api_key}
+
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        return "ERROR: Failed to fetch stock price"
+
+    data = response.json()
+    price = data.get("c")
+
+    if not price:
+        return "ERROR: No price available"
+
+    return f"{price} USD"
 
 
-@tool
-def calculator(query: str) -> str:
-    """A simple calculator tool."""
-    return ast.literal_eval(query)  # nosec
+class AgentState(TypedDict):
+    question: str
+    ticker: Optional[str]
+    tool_result: Optional[str]
+    final_answer: Optional[str]
 
-
-search = DuckDuckGoSearchRun()
-tools = [search, calculator]
 
 llm = ChatOllama(
     model="qwen2.5:7b-instruct",
     temperature=0
 )
 
-agent = create_agent(llm, tools)
+def extract_ticker(state: AgentState) -> AgentState:
+    q = state["question"].lower()
+
+    # Deterministic rules (extendable)
+    if "apple" in q:
+        state["ticker"] = "AAPL"
+    elif "tesla" in q:
+        state["ticker"] = "TSLA"
+    else:
+        state["ticker"] = None
+
+    return state
 
 
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
+def execute_tool(state: AgentState) -> AgentState:
+    if not state["ticker"]:
+        state["tool_result"] = "ERROR: Unknown ticker"
+        return state
+
+    state["tool_result"] = get_stock_price.invoke(
+        {"ticker": state["ticker"]}
+    )
+    return state
 
 
-def agent_node(state: State):
-    result = agent.invoke(state)
-    return {"messages": result["messages"]}
+def generate_final_answer(state: AgentState) -> AgentState:
+    prompt = f"""
+You are an assistant.
+
+The user asked:
+{state['question']}
+
+The stock price tool returned:
+{state['tool_result']}
+
+Provide a clear, concise answer.
+"""
+    response = llm.invoke([HumanMessage(content=prompt)])
+    state["final_answer"] = response.content
+    return state
 
 
-builder = StateGraph(State)
-builder.add_node("agent", agent_node)
-builder.add_edge(START, "agent")
+graph = StateGraph(AgentState)
 
-graph = builder.compile()
+graph.add_node("extract", extract_ticker)
+graph.add_node("tool", execute_tool)
+graph.add_node("final", generate_final_answer)
 
+graph.set_entry_point("extract")
 
-input_data = {
-    "messages": [
-        SystemMessage(
-            "You must use tools when external information or calculations are required."
-        ),
-        HumanMessage("How old was the 30th president of the United States when he died?")
-    ]
-}
+graph.add_conditional_edges(
+    "extract",
+    lambda s: "tool" if s["ticker"] else "final",
+    {
+        "tool": "tool",
+        "final": "final"
+    }
+)
 
-for step in graph.stream(input_data):
-    print(step)
+graph.add_edge("tool", "final")
+graph.add_edge("final", END)
+
+agent = graph.compile()
+
+if __name__ == "__main__":
+    result = agent.invoke({
+        "question": "What is the stock price of Apple?",
+        "ticker": None,
+        "tool_result": None,
+        "final_answer": None
+    })
+
+    print(result["final_answer"])

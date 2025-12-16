@@ -4,3 +4,5 @@ langchain-community
 langchain-anthropic
 python-dotenv
 pydantic
+langchain-text-splitters 
+bs4
